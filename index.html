@@ -81,6 +81,14 @@
   .nav-icon{width:20px;height:20px;}
   .fab{position:absolute;right:20px;bottom:96px;width:52px;height:52px;border-radius:50%;background:var(--brass);color:var(--board);border:none;font-size:26px;box-shadow:0 6px 20px rgba(182,255,60,.5);cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1;}
   .modal-wrap{position:absolute;inset:0;background:rgba(32,43,35,.55);display:flex;align-items:flex-end;z-index:20;}
+  .scan-overlay{position:absolute;inset:0;background:rgba(18,39,26,.94);z-index:26;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;text-align:center;padding:30px;}
+  .spinner{width:38px;height:38px;border:4px solid rgba(255,255,255,.25);border-top-color:var(--brass);border-radius:50%;animation:spin .9s linear infinite;margin-bottom:16px;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .scan-row{margin-bottom:12px;}
+  .scan-row .ing-row{margin-bottom:0;}
+  .scan-original{font-size:11px;color:var(--ink-soft);margin:4px 0 0 2px;}
+  .scan-toggle{width:22px;height:22px;border-radius:6px;border:2px solid var(--line);flex-shrink:0;cursor:pointer;display:flex;align-items:center;justify-content:center;background:#fff;font-size:13px;}
+  .scan-toggle.on{background:var(--sage);border-color:var(--sage);color:#fff;}
   .modal{background:var(--card);width:100%;max-height:88%;border-radius:20px 20px 0 0;overflow-y:auto;padding:20px 18px calc(24px + env(safe-area-inset-bottom));}
   .modal-title{font-family:var(--font-display);font-weight:700;font-style:italic;font-size:20px;margin:0 0 4px;}
   .close-x{position:absolute;top:16px;right:16px;background:var(--line);border:none;width:30px;height:30px;border-radius:50%;font-size:16px;color:var(--ink-soft);cursor:pointer;}
@@ -231,7 +239,10 @@ var state = {
   modal:null,
   editingRecipe:null,
   recipeDetail:null,
-  loading:true
+  loading:true,
+  scanning:false,
+  scanMessage:'',
+  scanItems:null
 };
 
 CATS.forEach(function(c){ if(!state.shopping[c]) state.shopping[c]=[]; });
@@ -433,14 +444,114 @@ function celebrate(){
   setTimeout(function(){ wrap.remove(); }, 2000);
 }
 
+function consumePantryForRecipe(recipe){
+  var status = ingredientStatus(recipe);
+  var movedCount = 0;
+  status.have.forEach(function(ing){
+    var name = ing.name.toLowerCase();
+    var idx = state.pantry.findIndex(function(p){
+      var pl = p.toLowerCase();
+      return pl===name || name.indexOf(pl)!==-1 || pl.indexOf(name)!==-1;
+    });
+    if (idx!==-1){
+      state.pantry.splice(idx,1);
+      var cat = guessCategory(ing.name);
+      var already = state.shopping[cat].some(function(it){ return it.name.toLowerCase()===ing.name.toLowerCase() && !it.checked; });
+      if (!already){
+        state.shopping[cat].push({id:uid(), name:ing.name, checked:false, from:recipe.name, nice:false});
+      }
+      movedCount++;
+    }
+  });
+  if (movedCount>0) saveMeta();
+  return movedCount;
+}
+
 function markCooked(recipe){
   recipe.lastMade = Date.now();
   recipe.timesMade = (recipe.timesMade||0)+1;
   saveRecipeDoc(recipe);
   pushActivity('cooked', recipe.name);
+  var moved = consumePantryForRecipe(recipe);
   celebrate();
-  toast('Nice! Logged as cooked tonight');
+  toast(moved>0 ? 'Cooked! '+moved+' ingredient'+(moved>1?'s':'')+' used up \u2014 moved to your shopping list' : 'Nice! Logged as cooked tonight');
   render();
+}
+
+function renderScanOverlay(){
+  return '<div class="scan-overlay"><div class="spinner"></div>'+
+    '<p style="font-family:var(--font-display);font-style:italic;font-weight:700;font-size:18px;margin:0 0 6px;">'+esc(state.scanMessage||'Reading your list\u2026')+'</p>'+
+    '<p class="muted" style="color:rgba(255,255,255,.7);">This can take a little while, especially the first time.</p>'+
+    '</div>';
+}
+
+function loadTesseract(){
+  if (window.Tesseract) return Promise.resolve();
+  return new Promise(function(resolve, reject){
+    var s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js';
+    s.onload = function(){ resolve(); };
+    s.onerror = function(){ reject(new Error('Could not load OCR library')); };
+    document.head.appendChild(s);
+  });
+}
+
+async function translateLine(text){
+  try{
+    var url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=et&tl=en&dt=t&q='+encodeURIComponent(text);
+    var res = await fetch(url);
+    if (!res.ok) return text;
+    var data = await res.json();
+    return data[0].map(function(seg){ return seg[0]; }).join('').trim();
+  }catch(e){ return text; }
+}
+
+async function runShoppingListScan(file){
+  state.scanning = true;
+  state.scanMessage = 'Loading the scanner\u2026';
+  render();
+  try{
+    await loadTesseract();
+    state.scanMessage = 'Reading the photo\u2026';
+    render();
+    var result = await Tesseract.recognize(file, 'est', {
+      logger: function(m){
+        if (m.status==='recognizing text' && typeof m.progress==='number'){
+          state.scanMessage = 'Reading the photo\u2026 '+Math.round(m.progress*100)+'%';
+          render();
+        }
+      }
+    });
+    var rawText = (result && result.data && result.data.text) || '';
+    var lines = rawText.split('\n').map(function(l){ return l.trim(); })
+      .filter(function(l){ return l.length>1; })
+      .filter(function(l){ return /[a-zA-ZäöüõžšÄÖÜÕŽŠ]/.test(l); })
+      .filter(function(l){ return !/^[\d.,€$£\s-]+$/.test(l); });
+    var seen = {};
+    lines = lines.filter(function(l){ var k=l.toLowerCase(); if (seen[k]) return false; seen[k]=true; return true; });
+
+    if (lines.length===0){
+      state.scanning = false;
+      toast('Couldn\u2019t find any text \u2014 try a clearer, well-lit photo');
+      render();
+      return;
+    }
+
+    state.scanMessage = 'Translating\u2026';
+    render();
+    var translations = await Promise.all(lines.map(translateLine));
+
+    state.scanItems = lines.map(function(l, i){
+      return { id: uid(), original: l, text: translations[i] || l, include: true };
+    });
+    state.scanning = false;
+    state.modal = 'scanReview';
+    render();
+  }catch(e){
+    state.scanning = false;
+    toast('Scan failed \u2014 try again with a clearer photo');
+    render();
+  }
 }
 
 function initials(name){
@@ -461,6 +572,7 @@ function render(){
   if (state.tab==='recipes') html += '<button class="fab" id="fabAdd" aria-label="Add recipe">+</button>';
   html += '<div class="toast" id="toast"></div>';
   if (state.modal) html += renderModal();
+  if (state.scanning) html += renderScanOverlay();
   app.innerHTML = html;
   bind();
 }
@@ -577,7 +689,10 @@ function renderRecipes(){
 }
 
 function renderPantry(){
-  var out = '<div class="card"><div class="ing-row"><input id="pantryInput" placeholder="e.g. garlic, chicken thighs, rice"><button class="btn btn-primary" id="pantryAdd" style="width:auto;padding:11px 16px;">Add</button></div></div>';
+  var out = '<div class="card"><div class="ing-row"><input id="pantryInput" placeholder="e.g. garlic, chicken thighs, rice"><button class="btn btn-primary" id="pantryAdd" style="width:auto;padding:11px 16px;">Add</button></div>'+
+    '<input type="file" accept="image/*" id="pantryScanInput" style="display:none;">'+
+    '<button class="btn btn-secondary" id="pantryScanBtn" style="margin-top:10px;">📷 Scan a shopping list photo</button>'+
+    '</div>';
   if (state.pantry.length===0){
     out += '<div class="empty"><div class="empty-icon">🧺</div><p class="empty-title">Pantry\u2019s empty</p><p class="muted">Add what\u2019s in your fridge and cupboards so the app knows what you can cook right now.</p></div>';
     return out;
@@ -749,6 +864,26 @@ function renderModal(){
       '<button class="btn btn-primary" id="saveNameBtn" style="margin-top:16px;">Save</button>'+
       '</div></div>';
   }
+  if (state.modal==='scanReview'){
+    var items = state.scanItems || [];
+    var rows = items.map(function(it){
+      return '<div class="scan-row"><div class="ing-row">'+
+        '<button class="scan-toggle'+(it.include?' on':'')+'" data-scan-toggle="'+it.id+'">'+(it.include?'✓':'')+'</button>'+
+        '<input class="scan-text" data-scan-text="'+it.id+'" value="'+esc(it.text)+'">'+
+        '<button class="ing-remove" data-scan-remove="'+it.id+'">&times;</button>'+
+        '</div>'+
+        (it.original.toLowerCase()!==it.text.toLowerCase() ? '<p class="scan-original">scanned: \u201c'+esc(it.original)+'\u201d</p>' : '')+
+        '</div>';
+    }).join('');
+    var includedCount = items.filter(function(it){ return it.include && it.text.trim(); }).length;
+    return '<div class="modal-wrap" id="modalWrap"><div class="modal">'+
+      '<button class="close-x" id="modalClose">&times;</button>'+
+      '<p class="modal-title">Review scanned items</p>'+
+      '<p class="muted" style="margin-bottom:16px;">Fix any word that came out wrong, tap the checkmark to leave something out, or delete it entirely.</p>'+
+      (items.length===0 ? '<p class="muted">No items found.</p>' : '<div id="scanList">'+rows+'</div>')+
+      '<button class="btn btn-primary" id="confirmScanBtn" style="margin-top:14px;">Add '+includedCount+' item'+(includedCount===1?'':'s')+' to Pantry</button>'+
+      '</div></div>';
+  }
   return '';
 }
 
@@ -799,6 +934,14 @@ function bind(){
     };
     if (pAdd) pAdd.onclick = addPantry;
     if (pInput) pInput.onkeydown = function(e){ if (e.key==='Enter') addPantry(); };
+    var pScanBtn = document.getElementById('pantryScanBtn');
+    var pScanInput = document.getElementById('pantryScanInput');
+    if (pScanBtn && pScanInput) pScanBtn.onclick = function(){ pScanInput.click(); };
+    if (pScanInput) pScanInput.onchange = function(){
+      var file = pScanInput.files[0];
+      pScanInput.value = '';
+      if (file) runShoppingListScan(file);
+    };
     document.querySelectorAll('[data-pantry-remove]').forEach(function(btn){
       btn.onclick = function(){
         var v = btn.getAttribute('data-pantry-remove');
@@ -926,6 +1069,43 @@ function bind(){
     state.identity = {name:v};
     saveIdentity();
     state.modal=null; render();
+  };
+
+  document.querySelectorAll('[data-scan-toggle]').forEach(function(btn){
+    btn.onclick = function(){
+      var id = btn.getAttribute('data-scan-toggle');
+      var item = (state.scanItems||[]).find(function(it){ return it.id===id; });
+      if (item){ item.include = !item.include; render(); }
+    };
+  });
+  document.querySelectorAll('[data-scan-text]').forEach(function(inp){
+    inp.oninput = function(){
+      var id = inp.getAttribute('data-scan-text');
+      var item = (state.scanItems||[]).find(function(it){ return it.id===id; });
+      if (item) item.text = inp.value;
+    };
+  });
+  document.querySelectorAll('[data-scan-remove]').forEach(function(btn){
+    btn.onclick = function(){
+      var id = btn.getAttribute('data-scan-remove');
+      state.scanItems = (state.scanItems||[]).filter(function(it){ return it.id!==id; });
+      render();
+    };
+  });
+  var confirmScanBtn = document.getElementById('confirmScanBtn');
+  if (confirmScanBtn) confirmScanBtn.onclick = function(){
+    var added = 0;
+    (state.scanItems||[]).forEach(function(it){
+      var v = it.text.trim();
+      if (it.include && v){
+        var exists = state.pantry.some(function(p){ return p.toLowerCase()===v.toLowerCase(); });
+        if (!exists){ state.pantry.push(v); added++; }
+      }
+    });
+    if (added>0) savePantry();
+    state.modal = null; state.scanItems = null;
+    toast(added>0 ? added+' item'+(added===1?'':'s')+' added to your pantry' : 'No items added');
+    render();
   };
 }
 
